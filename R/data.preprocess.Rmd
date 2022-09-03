@@ -1,0 +1,153 @@
+---
+title: "data-preprocessing"
+author: "Bowen He"
+date: "7/26/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(raster)
+library(sf)
+library(exactextractr)
+library(sp)
+library(tidycensus)
+library(tidyverse)
+library(Metrics)
+library(stars)
+library(rprojroot)
+library(rgeos)
+proj_root <- find_root(is_rstudio_project)
+CRS <- "+proj=utm +zone=16 +datum=NAD83 +units=km +no_defs +ellps=GRS80 +towgs84=0,0,0"
+```
+
+In this Rmarkdown document, I will read in the decennial 2020 census tract dataframe, 
+decennial 2020 census block group dataframe, decennial 2020 census block dataframe, 
+and the 2019 NLCD land cover raster.
+
+Then, I will perform the spatial data join analysis to integrate the decennial 2020 CT, 
+the decennial 2020 CBG, the decennial 2020 CB, and the 2019 NLCD land cover data together.
+The product (ct_land_cover_df.Rds) of this R code is a dataframe that contains each 
+2020 decennial census tract of the Davidson County, Nashville and its corresponding population, 
+sum of each land cover codes as well as the census tract it belongs to.
+
+This dataframe will be used to perform the regularized analysis to select the significant land
+cover covariates in the proposed spatial model.
+
+# Retrieve Decennial 2020 total population data {#decennial2020-pop}
+Retrieve the Decennial 2020 total population data of the Davidson County, Nashville
+as the research subject of interest.
+```{r ct-process include = FALSE, message = FALSE, warning = FALSE}
+pop.tract <- get_decennial(geography = "tract", sumfile = "pl", state = 'TN', county = 'Davidson', variables = "P1_001N", year = 2020, geometry = TRUE)
+census_tract <- pop.tract %>%
+  dplyr::select(-variable, -value) %>% rename('CT_NAME' = 'NAME') %>%
+  mutate(area = st_area(.))
+
+st_write(census_tract, dsn = file.path(proj_root, "data", 'src/census_tract'), layer = "census_tract",
+         driver = "ESRI Shapefile", append = FALSE)
+# CBG
+pop.cbg <- get_decennial(geography = "block group", sumfile = 'pl', state = 'TN', county = 'Davidson', variables = "P1_001N", year = 2020, geometry = TRUE)
+census_block_group <- pop.cbg %>%
+  dplyr::select(-variable, -value) %>% rename('CBG_NAME' = 'NAME')%>%
+  mutate(area = st_area(.))
+
+st_write(census_block_group, dsn = file.path(proj_root, "data", 'src/census_block_group'), layer = "census_block_group",
+         driver = "ESRI Shapefile", append = FALSE)
+
+# CB
+pop.cb <- get_decennial(geography = "block", sumfile = 'pl', state = 'TN', county = 'Davidson', variables = "P1_001N", year = 2020, geometry = TRUE)
+census_block <- pop.cb %>% 
+  dplyr::select(-variable, -value) %>% rename('CB_NAME' = 'NAME')%>%
+  mutate(area = st_area(.))
+
+st_write(census_block, dsn = file.path(proj_root, "data", 'src/census_block'), layer = "census_block",
+         driver = "ESRI Shapefile", append = FALSE)
+```
+
+# spatially join the CB and CT dataframe {#CB-join-CT}
+Create another column called TRACT to include the information of the census tract that the census block belongs to.
+```{r spatial-join-cb-ct include = FALSE, message=FALSE, warning=FALSE}
+CB_CT <- CB %>% 
+  st_drop_geometry() %>%
+  extract(CB_NAME, into = c('BLOCK', 'TRACT'), "^(Block \\d+).*(Census Tract.*)") %>%
+  left_join(CB %>% dplyr::select(-CB_NAME, -area), by = 'GEOID') # re
+
+st_write(CB_CT, dsn = file.path(proj_root, "data", 'src/cb_ct'), layer = "cb_ct",
+         driver = "ESRI Shapefile", append = FALSE)
+```
+
+# Import the 2019 NLCD raster {#nlcd-raster}
+Import the newest 2019 Davidson county NLCD land cover raster data.
+```{r 2019-nlcd include = FALSE, message = FALSE, warning = FALSE}
+nlcd_raster <- raster::raster(file.path(proj_root, "data/src/NLCD-2019/nlcd-2019.img"))
+```
+
+# Transform 2019 NLCD raster points{#nlcd-pts}
+```{r 2019-nlcd-pts include = FALSE, message = FALSE, warning = FALSE}
+nlcd_pts <- rasterToPoints(nlcd_raster) %>% 
+  as.data.frame() %>%
+  st_as_sf(coords = c('x', 'y')) %>%
+  st_set_crs(CRS)
+
+write_rds(list(nlcd_pts = nlcd_pts),
+          path = file.path(data_dir = file.path(proj_root, "data"), "src/nlcd_pts.Rds"))
+```
+
+# Spatial join the NLCD raster with the census tract {#ct-sum-nlcd}
+Sum the land cover grids of each land cover type into Davidson county shapefile: census tract.
+```{r spatial-sum-nlcd include = FALSE, message=FALSE, warning=FALSE}
+#spatial join the nlcd raster (2019) with the census tract
+ct_land_cover_df <- st_join(nlcd_pts, census_tract %>% st_transform(crs = CRS), join = st_intersects) %>%
+  st_drop_geometry() %>%
+  group_by(GEOID) %>%
+  count(nlcd.2019) %>%
+  pivot_wider(names_from = nlcd.2019, values_from = n)
+
+ct_land_cover_df <- filter(ct_land_cover_df, !is.na(GEOID))
+ct_land_cover_df[is.na(ct_land_cover_df)] <- 0 
+ct_land_cover_df <- ct_land_cover_df %>%
+   dplyr::select(-`128`)
+
+land_use_table <- c(
+  "GEOID" = "GEOID",
+  "21" = "developed_open_space",
+  "22" = "developed_low_intensity",
+  "23" = "developed_medium_intensity",
+  "24" = "developed_high_intensity",
+  "31" = "barren",
+  "41" = "deciduous_forest",
+  "42" = "evergreen_forest",
+  "43" = "mixed_forest",
+  "52" = "shrub",
+  "71" = 'grassland',
+  "81" = 'pasture',
+  "11" = "open_water",
+  "82" = "cultivated_crops",
+  "90" = "woody_wetlands",
+  "95" = "herbaceous_wetlands"
+)
+
+colnames(ct_land_cover_df) <- land_use_table[colnames(ct_land_cover_df)] 
+
+ct_land_cover_df <- left_join(census_tract, ct_land_cover_df, by = 'GEOID') %>%
+  mutate(area = st_area(.)) %>%
+  drop_units()
+
+write_rds(list(ct_land_cover_df = ct_land_cover_df),
+          path = file.path(data_dir = file.path(proj_root, "data"), "src/ct_land_cover_df.Rds"))
+```
+
+# spatial join the census tract and the NLCD grids {ct-join-nlcd} 
+```{r spatial-join-nlcd include = FALSE, message=FALSE, warning=FALSE}
+#spatial join the nlcd raster (2019) with the census tract
+nlcd_grids_ct_df <- st_join(nlcd_pts, census_tract %>% st_transform(crs = CRS), join = st_intersects) %>%
+   st_drop_geometry() 
+
+# append the land use information
+nlcd_grids_ct_df <- nlcd_grids_ct_df %>%
+   mutate(land_use = land_use_table[as.character(nlcd_grids_ct_df$nlcd.2019)])
+ 
+# generate the joined census tract and NLCD grids df 
+write_rds(list(nlcd_grids_ct_df = nlcd_grids_ct_df),
+           path = file.path(data_dir = file.path(proj_root, "data"), "src/nlcd_grids_ct_df.Rds"))
+```
